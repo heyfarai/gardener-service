@@ -1,12 +1,20 @@
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List
-from fastapi.middleware.cors import CORSMiddleware
-import os, time, uuid, math, logging
+import os
+import time
+import uuid
+import math
+import logging
 from contextlib import asynccontextmanager
+from typing import Optional, List
 
 import asyncpg
-from openai import AsyncOpenAI
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Environment configuration
 API_KEY = os.getenv("GARDENER_TOKEN", "")
@@ -17,33 +25,33 @@ USE_OPENAI = os.getenv("USE_OPENAI", "false").lower() == "true"
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Global variables for database and embedding model
+# Global variables for database
 db_pool = None
-embedding_model = None
-openai_client = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_pool, embedding_model, openai_client
+    global db_pool
     logger.info("Starting gardener service...")
     
     # Initialize database connection
-    if DATABASE_URL:
+    if DATABASE_URL and DATABASE_URL.strip():
         try:
             db_pool = await asyncpg.create_pool(DATABASE_URL)
             logger.info("Database connection established")
             
-            # Create tables if they don't exist
             async with db_pool.acquire() as conn:
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS topics (
                         id VARCHAR PRIMARY KEY,
                         label VARCHAR NOT NULL,
                         centroid FLOAT[] NOT NULL,
-                        updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        updated TIMESTAMP DEFAULT NOW()
                     )
                 """)
                 await conn.execute("""
@@ -59,21 +67,16 @@ async def lifespan(app: FastAPI):
                 logger.info("Database tables initialized")
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
+            logger.info("Falling back to in-memory storage")
+            db_pool = None
     else:
         logger.info("Using in-memory storage (no DATABASE_URL provided)")
     
-    # Initialize embedding model
     logger.info(f"Environment check - USE_OPENAI: {USE_OPENAI}, OPENAI_API_KEY present: {bool(OPENAI_API_KEY)}")
-    try:
-        if USE_OPENAI and OPENAI_API_KEY:
-            logger.info("Attempting to initialize OpenAI client...")
-            openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-            logger.info("OpenAI embeddings initialized successfully")
-        else:
-            logger.info("Using fallback embeddings (set USE_OPENAI=true for better results)")
-    except Exception as e:
-        logger.error(f"Embedding model initialization failed: {e}")
-        logger.info("Falling back to deterministic embeddings")
+    if USE_OPENAI and OPENAI_API_KEY:
+        logger.info("OpenAI embeddings configured and ready")
+    else:
+        logger.warning("Using fallback embeddings - set USE_OPENAI=true and provide OPENAI_API_KEY for better results")
     
     logger.info("Gardener service startup complete")
     yield
@@ -96,39 +99,60 @@ app.add_middleware(
 SNIPS = [] # {id, chat_id, ts, text, vec, topic_id}
 TOPICS = {} # id -> {label, centroid, updated}
 
-async def embed(text: str) -> List[float]:
-    """Generate embeddings using OpenAI or fallback"""
-    try:
-        if USE_OPENAI and openai_client:
-            response = await openai_client.embeddings.create(
-                model="text-embedding-3-small",
-                input=text
+def embed(text: str) -> List[float]:
+    """Generate embeddings using OpenAI API or deterministic fallback."""
+    if USE_OPENAI and OPENAI_API_KEY:
+        try:
+            response = requests.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "text-embedding-3-small",
+                    "input": text
+                },
+                timeout=30
             )
-            return response.data[0].embedding
-        else:
-            # Fallback to deterministic fake embeddings
-            import hashlib, random
-            random.seed(int(hashlib.md5(text.encode()).hexdigest(),16) % 10**6)
-            return [random.random() for _ in range(384)]
-    except Exception as e:
-        logger.error(f"Embedding generation failed: {e}")
-        # Fallback to fake embeddings
-        import hashlib, random
-        random.seed(int(hashlib.md5(text.encode()).hexdigest(),16) % 10**6)
-        return [random.random() for _ in range(384)]
+            response.raise_for_status()
+            return response.json()["data"][0]["embedding"]
+        except Exception as e:
+            logger.error(f"OpenAI embedding failed: {e}")
+    
+    # Fallback to deterministic embeddings
+    import hashlib
+    import random
+    
+    seed = int(hashlib.md5(text.encode()).hexdigest(), 16) % 10**6
+    random.seed(seed)
+    return [random.random() for _ in range(384)]
 
-def cosine(a,b):
-    na = math.sqrt(sum(x*x for x in a)); nb = math.sqrt(sum(y*y for y in b))
-    if not na or not nb: return 0.0
-    return sum(x*y for x,y in zip(a,b))/(na*nb)
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Calculate cosine similarity between two vectors."""
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    
+    if not norm_a or not norm_b:
+        return 0.0
+    
+    return sum(x * y for x, y in zip(a, b)) / (norm_a * norm_b)
 
 class Turn(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    
     chat_id: str
     turn_id: str
     user_text: Optional[str] = ""
     model_text: Optional[str] = ""
     model: Optional[str] = None
     ts: Optional[str] = None
+
+
+class RetrieveReq(BaseModel):
+    query: Optional[str] = None
+    topic_id: Optional[str] = None
+    k: int = 5
 
 @app.get("/")
 def root():
@@ -139,12 +163,7 @@ def health():
     return {
         "status": "healthy",
         "database": "connected" if db_pool else "memory",
-        "embedding": "openai" if (USE_OPENAI and OPENAI_API_KEY and openai_client) else "fallback",
-        "debug": {
-            "USE_OPENAI": USE_OPENAI,
-            "has_api_key": bool(OPENAI_API_KEY),
-            "client_initialized": openai_client is not None
-        }
+        "embedding": "openai" if (USE_OPENAI and OPENAI_API_KEY) else "fallback"
     }
 
 @app.get("/topics")
@@ -166,76 +185,111 @@ async def list_topics():
                 "updated": meta["updated"],
                 "snippet_count": snippet_count
             })
-        topic_list.sort(key=lambda x: x["updated"], reverse=True)
         return {"topics": topic_list}
 
-@app.post("/turn")
-async def turn(t: Turn, authorization: str = Header(None)):
-    if authorization != f"Bearer {API_KEY}":
-        raise HTTPException(401, "bad token")
-    
+@app.get("/topics")
+async def topics():
     try:
-        for text in [t.user_text, t.model_text]:
-            if not text: continue
-            v = await embed(text)
-            
-            # Use database if available, otherwise fallback to memory
-            if db_pool:
-                await process_text_db(text, v, t.chat_id, t.ts)
-            else:
-                await process_text_memory(text, v, t.chat_id, t.ts)
+        logger.info("Fetching all topics")
         
-        return {"ok": True}
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                ts = await conn.fetch("SELECT id, label, updated FROM topics ORDER BY updated DESC")
+                result = [{"id": t["id"], "label": t["label"], "updated": t["updated"].isoformat()} for t in ts]
+        else:
+            result = [{"id": tid, "label": meta["label"], "updated": meta["updated"]} for tid,meta in TOPICS.items()]
+        
+        logger.info(f"Retrieved {len(result)} topics")
+        return result
+    
     except Exception as e:
-        logger.error(f"Error processing turn: {e}")
-        raise HTTPException(500, "Internal server error")
+        logger.error(f"Error fetching topics: {e}")
+        raise HTTPException(500, f"Failed to fetch topics: {str(e)}")
+
+@app.post("/turn")
+async def turn(t: Turn, authorization: Optional[str] = Header(None)):
+    try:
+        if API_KEY and authorization != f"Bearer {API_KEY}":
+            raise HTTPException(401, "unauthorized")
+        
+        text = f"{t.user_text} {t.model_text}".strip()
+        if not text:
+            logger.warning(f"Empty text received for chat_id: {t.chat_id}")
+            return {"status": "empty"}
+        
+        logger.info(f"Processing turn for chat_id: {t.chat_id}, text length: {len(text)}")
+        
+        v = embed(text)
+        ts = t.ts or str(int(time.time()))
+        
+        if db_pool:
+            await process_text_db(text, v, t.chat_id, ts)
+        else:
+            await process_text_memory(text, v, t.chat_id, ts)
+        
+        logger.info(f"Successfully processed turn for chat_id: {t.chat_id}")
+        return {"status": "processed", "chat_id": t.chat_id, "turn_id": t.turn_id}
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing turn for chat_id {t.chat_id}: {e}")
+        raise HTTPException(500, f"Internal server error: {str(e)}")
 
 async def process_text_db(text: str, v: List[float], chat_id: str, ts: str):
     """Process text using database storage"""
-    async with db_pool.acquire() as conn:
-        # Find nearest topic
-        topics = await conn.fetch("SELECT id, label, centroid FROM topics")
-        best_id, best_score = None, 0.0
-        
-        for topic in topics:
-            centroid = topic['centroid']
-            score = cosine(v, centroid)
-            if score > best_score:
-                best_score = score
-                best_id = topic['id']
-        
-        # Create new topic if similarity too low
-        if best_id is None or best_score < 0.78:
-            label = " ".join(text.split()[:4]).strip(" ,.") or f"Topic {len(topics)+1}"
-            best_id = f"topic_{uuid.uuid4().hex[:6]}"
+    try:
+        async with db_pool.acquire() as conn:
+            # Find nearest topic
+            topics = await conn.fetch("SELECT id, label, centroid FROM topics")
+            best_id, best_score = None, 0.0
+            
+            for topic in topics:
+                centroid = topic['centroid']
+                score = cosine_similarity(v, centroid)
+                if score > best_score:
+                    best_score = score
+                    best_id = topic['id']
+            
+            # Create new topic if similarity too low
+            if best_id is None or best_score < 0.78:
+                label = " ".join(text.split()[:4]).strip(" ,.") or f"Topic {len(topics)+1}"
+                best_id = f"topic_{uuid.uuid4().hex[:6]}"
+                await conn.execute(
+                    "INSERT INTO topics (id, label, centroid) VALUES ($1, $2, $3)",
+                    best_id, label, v
+                )
+                logger.info(f"Created new topic: {best_id} - {label}")
+            else:
+                # Update centroid with EMA (alpha=0.1)
+                old_centroid = await conn.fetchval(
+                    "SELECT centroid FROM topics WHERE id = $1", best_id
+                )
+                alpha = 0.1
+                new_centroid = [(1-alpha)*old_centroid[i] + alpha*v[i] for i in range(len(v))]
+                await conn.execute(
+                    "UPDATE topics SET centroid = $1, updated = NOW() WHERE id = $2",
+                    new_centroid, best_id
+                )
+                logger.debug(f"Updated topic centroid: {best_id}")
+            
+            # Store snippet
+            sid = f"s_{uuid.uuid4().hex[:6]}"
             await conn.execute(
-                "INSERT INTO topics (id, label, centroid) VALUES ($1, $2, $3)",
-                best_id, label, v
+                "INSERT INTO snippets (id, chat_id, ts, text, embedding, topic_id) VALUES ($1, $2, $3, $4, $5, $6)",
+                sid, chat_id, ts, text, v, best_id
             )
-        else:
-            # Update centroid with EMA
-            current_centroid = await conn.fetchval(
-                "SELECT centroid FROM topics WHERE id = $1", best_id
-            )
-            alpha = 0.15
-            new_centroid = [(1-alpha)*current_centroid[i] + alpha*v[i] for i in range(len(v))]
-            await conn.execute(
-                "UPDATE topics SET centroid = $1, updated = CURRENT_TIMESTAMP WHERE id = $2",
-                new_centroid, best_id
-            )
-        
-        # Insert snippet
-        sid = f"s_{uuid.uuid4().hex[:6]}"
-        await conn.execute(
-            "INSERT INTO snippets (id, chat_id, ts, text, embedding, topic_id) VALUES ($1, $2, $3, $4, $5, $6)",
-            sid, chat_id, ts, text, v, best_id
-        )
+            logger.debug(f"Stored snippet: {sid} in topic: {best_id}")
+    
+    except Exception as e:
+        logger.error(f"Database processing error: {e}")
+        raise
 
 async def process_text_memory(text: str, v: List[float], chat_id: str, ts: str):
     """Process text using in-memory storage (fallback)"""
     best_id, best = None, 0.0
     for tid, meta in TOPICS.items():
-        s = cosine(v, meta["centroid"])
+        s = cosine_similarity(v, meta["centroid"])
         if s > best: best, best_id = s, tid
     
     if best_id is None or best < 0.78:
@@ -253,87 +307,127 @@ async def process_text_memory(text: str, v: List[float], chat_id: str, ts: str):
 
 @app.get("/topics/search")
 async def search(q: str, k: int = 8):
-    v = await embed(q)
+    try:
+        if not q.strip():
+            raise HTTPException(400, "Query cannot be empty")
+        
+        logger.info(f"Searching topics for query: {q[:50]}...")
+        v = embed(q)
+        
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                topics = await conn.fetch("SELECT id, label, centroid FROM topics")
+                scored = [(t['id'], t['label'], cosine_similarity(v, t['centroid'])) for t in topics]
+        else:
+            scored = [(tid, meta["label"], cosine_similarity(v, meta["centroid"])) for tid,meta in TOPICS.items()]
+        
+        scored.sort(key=lambda x: x[2], reverse=True)
+        results = [{"id": tid, "label": lbl, "score": float(sc)} for tid,lbl,sc in scored[:k]]
+        
+        logger.info(f"Found {len(results)} topic matches")
+        return {"query": q, "results": results}
     
-    if db_pool:
-        async with db_pool.acquire() as conn:
-            topics = await conn.fetch("SELECT id, label, centroid FROM topics")
-            scored = [(t['id'], t['label'], cosine(v, t['centroid'])) for t in topics]
-    else:
-        scored = [(tid, meta["label"], cosine(v, meta["centroid"])) for tid,meta in TOPICS.items()]
-    
-    scored.sort(key=lambda x: x[2], reverse=True)
-    return {"query": q, "results": [{"id": tid, "label": lbl, "score": float(sc)} for tid,lbl,sc in scored[:k]]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Topic search error: {e}")
+        raise HTTPException(500, f"Search failed: {str(e)}")
 
 @app.get("/topics/{topic_id}/brief")
 async def brief(topic_id: str, max_tokens: int = 600):
-    if db_pool:
-        async with db_pool.acquire() as conn:
-            topic = await conn.fetchrow("SELECT * FROM topics WHERE id = $1", topic_id)
-            if not topic: raise HTTPException(404, "no topic")
+    try:
+        logger.info(f"Generating brief for topic: {topic_id}")
+        
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                topic = await conn.fetchrow("SELECT * FROM topics WHERE id = $1", topic_id)
+                if not topic:
+                    raise HTTPException(404, f"Topic {topic_id} not found")
+                
+                snippets = await conn.fetch(
+                    "SELECT text, embedding FROM snippets WHERE topic_id = $1", topic_id
+                )
+                sims = [(s['text'], cosine_similarity(s['embedding'], topic['centroid'])) for s in snippets]
+                sims.sort(key=lambda x: x[1], reverse=True)
+                picks = [text for text, _ in sims[:5]]
+                
+                return {
+                    "id": topic_id, 
+                    "label": topic["label"], 
+                    "summary_markdown": " • ".join(picks)[:max_tokens*4], 
+                    "updated": topic["updated"].isoformat()
+                }
+        else:
+            topic = TOPICS.get(topic_id)
+            if not topic:
+                raise HTTPException(404, f"Topic {topic_id} not found")
             
-            snippets = await conn.fetch(
-                "SELECT text, embedding FROM snippets WHERE topic_id = $1", topic_id
-            )
-            sims = [(s['text'], cosine(s['embedding'], topic['centroid'])) for s in snippets]
+            sims = [(s, cosine_similarity(s["vec"], topic["centroid"])) for s in SNIPS if s["topic_id"]==topic_id]
             sims.sort(key=lambda x: x[1], reverse=True)
-            picks = [text for text, _ in sims[:5]]
-            
-            return {
-                "id": topic_id, 
-                "label": topic["label"], 
-                "summary_markdown": " • ".join(picks)[:max_tokens*4], 
-                "updated": topic["updated"].isoformat()
-            }
-    else:
-        topic = TOPICS.get(topic_id)
-        if not topic: raise HTTPException(404, "no topic")
-        sims = [(s, cosine(s["vec"], topic["centroid"])) for s in SNIPS if s["topic_id"]==topic_id]
-        sims.sort(key=lambda x: x[1], reverse=True)
-        picks = [s["text"] for s,_ in sims[:5]]
-        txt = " • ".join(picks)[:max_tokens*4]
-        return {"id": topic_id, "label": topic["label"], "summary_markdown": txt, "updated": topic["updated"]}
+            picks = [s["text"] for s,_ in sims[:5]]
+            txt = " • ".join(picks)[:max_tokens*4]
+            return {"id": topic_id, "label": topic["label"], "summary_markdown": txt, "updated": topic["updated"]}
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Brief generation error for topic {topic_id}: {e}")
+        raise HTTPException(500, f"Brief generation failed: {str(e)}")
 
-class RetrieveReq(BaseModel):
-    query: Optional[str] = None
-    topic_id: Optional[str] = None
-    k: int = 5
 
 @app.post("/retrieve")
 async def retrieve(r: RetrieveReq):
-    topic_vec = None
-    query_vec = await embed(r.query) if r.query else None
-    
-    if db_pool:
-        async with db_pool.acquire() as conn:
-            if r.topic_id:
-                topic_vec = await conn.fetchval(
-                    "SELECT centroid FROM topics WHERE id = $1", r.topic_id
+    try:
+        if not r.query and not r.topic_id:
+            raise HTTPException(400, "Either query or topic_id must be provided")
+        
+        logger.info(f"Retrieving snippets - query: {r.query[:50] if r.query else 'None'}, topic_id: {r.topic_id}, k: {r.k}")
+        
+        topic_vec = None
+        query_vec = embed(r.query) if r.query else None
+        
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                if r.topic_id:
+                    topic_vec = await conn.fetchval(
+                        "SELECT centroid FROM topics WHERE id = $1", r.topic_id
+                    )
+                    if topic_vec is None:
+                        raise HTTPException(404, f"Topic {r.topic_id} not found")
+                
+                snippets = await conn.fetch(
+                    "SELECT id, text, chat_id, embedding FROM snippets"
                 )
+                scored = []
+                for s in snippets:
+                    score = 0.0
+                    if topic_vec: score += 0.6 * cosine_similarity(s['embedding'], topic_vec)
+                    if query_vec: score += 0.4 * cosine_similarity(s['embedding'], query_vec)
+                    scored.append((s, score))
+        else:
+            if r.topic_id and r.topic_id not in TOPICS:
+                raise HTTPException(404, f"Topic {r.topic_id} not found")
             
-            snippets = await conn.fetch(
-                "SELECT id, text, chat_id, embedding FROM snippets"
-            )
+            topic_vec = TOPICS.get(r.topic_id, {}).get("centroid") if r.topic_id else None
             scored = []
-            for s in snippets:
+            for s in SNIPS:
                 score = 0.0
-                if topic_vec: score += 0.6 * cosine(s['embedding'], topic_vec)
-                if query_vec: score += 0.4 * cosine(s['embedding'], query_vec)
+                if topic_vec: score += 0.6 * cosine_similarity(s["vec"], topic_vec)
+                if query_vec: score += 0.4 * cosine_similarity(s["vec"], query_vec)
                 scored.append((s, score))
-    else:
-        topic_vec = TOPICS.get(r.topic_id, {}).get("centroid") if r.topic_id else None
-        scored = []
-        for s in SNIPS:
-            score = 0.0
-            if topic_vec: score += 0.6 * cosine(s["vec"], topic_vec)
-            if query_vec: score += 0.4 * cosine(s["vec"], query_vec)
-            scored.append((s, score))
+        
+        scored.sort(key=lambda x: x[1], reverse=True)
+        
+        if db_pool:
+            out = [{"rank": i+1, "text": s["text"], "chat_id": s["chat_id"], "snippet_id": s["id"]} for i,(s,_) in enumerate(scored[:r.k])]
+        else:
+            out = [{"rank": i+1, "text": s["text"], "chat_id": s["chat_id"], "snippet_id": s["id"]} for i,(s,_) in enumerate(scored[:r.k])]
+        
+        logger.info(f"Retrieved {len(out)} snippets")
+        return {"items": out}
     
-    scored.sort(key=lambda x: x[1], reverse=True)
-    
-    if db_pool:
-        out = [{"rank": i+1, "text": s["text"], "chat_id": s["chat_id"], "snippet_id": s["id"]} for i,(s,_) in enumerate(scored[:r.k])]
-    else:
-        out = [{"rank": i+1, "text": s["text"], "chat_id": s["chat_id"], "snippet_id": s["id"]} for i,(s,_) in enumerate(scored[:r.k])]
-    
-    return {"items": out}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Retrieval error: {e}")
+        raise HTTPException(500, f"Retrieval failed: {str(e)}")
