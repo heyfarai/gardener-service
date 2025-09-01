@@ -3,9 +3,20 @@ from pydantic import BaseModel
 from typing import Optional, List
 from fastapi.middleware.cors import CORSMiddleware
 import os, time, uuid, math, logging
-import asyncpg
-from openai import AsyncOpenAI
 from contextlib import asynccontextmanager
+
+# Optional imports
+try:
+    import asyncpg
+    ASYNCPG_AVAILABLE = True
+except ImportError:
+    ASYNCPG_AVAILABLE = False
+
+try:
+    from openai import AsyncOpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 # Environment configuration
 API_KEY = os.getenv("GARDENER_TOKEN", "")
@@ -30,7 +41,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting gardener service...")
     
     # Initialize database connection
-    if DATABASE_URL:
+    if DATABASE_URL and ASYNCPG_AVAILABLE:
         try:
             db_pool = await asyncpg.create_pool(DATABASE_URL)
             logger.info("Database connection established")
@@ -58,10 +69,12 @@ async def lifespan(app: FastAPI):
                 logger.info("Database tables initialized")
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
+    else:
+        logger.info("Using in-memory storage (no DATABASE_URL or asyncpg not available)")
     
     # Initialize embedding model
     try:
-        if USE_OPENAI and OPENAI_API_KEY:
+        if USE_OPENAI and OPENAI_API_KEY and OPENAI_AVAILABLE:
             openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
             logger.info("OpenAI embeddings initialized")
         else:
@@ -93,7 +106,7 @@ TOPICS = {} # id -> {label, centroid, updated}
 async def embed(text: str) -> List[float]:
     """Generate embeddings using OpenAI or fallback"""
     try:
-        if USE_OPENAI and openai_client:
+        if USE_OPENAI and openai_client and OPENAI_AVAILABLE:
             response = await openai_client.embeddings.create(
                 model="text-embedding-3-small",
                 input=text
