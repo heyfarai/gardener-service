@@ -10,7 +10,7 @@ import numpy as np
 from contextlib import asynccontextmanager
 
 # Environment configuration
-API_KEY = os.getenv("TOPICNAV_TOKEN", "")
+API_KEY = os.getenv("GARDENER_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")

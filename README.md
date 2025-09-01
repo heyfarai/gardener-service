@@ -23,7 +23,7 @@ A FastAPI service that creates an "idea garden" by automatically clustering and 
 
 ```bash
 # Required
-TOPICNAV_TOKEN=your_secret_token_here
+GARDENER_TOKEN=your_secret_token_here
 
 # Database (Railway provides automatically)
 DATABASE_URL=postgresql://user:password@host:port/database
@@ -43,7 +43,7 @@ This service is designed to integrate with your existing Railway project contain
 
 1. **Connect to Railway**: Add this as a new service in your existing Railway project
 2. **Environment Variables**: Railway will auto-provide `DATABASE_URL` and `PORT`
-3. **Set Required Variables**: Add `TOPICNAV_TOKEN` and optionally `OPENAI_API_KEY`
+3. **Set Required Variables**: Add `GARDENER_TOKEN` and optionally `OPENAI_API_KEY`
 4. **Deploy**: Railway will automatically build and deploy using the Dockerfile
 
 ## Integration with LibreChat
@@ -53,7 +53,7 @@ Configure LibreChat to send conversation data to this service:
 ```bash
 # In LibreChat environment
 GARDENER_SERVICE_URL=https://your-gardener-service.railway.app
-GARDENER_TOKEN=your_topicnav_token
+GARDENER_TOKEN=your_gardener_token
 ```
 
 ## Local Development
