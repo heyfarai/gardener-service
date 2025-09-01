@@ -4,7 +4,7 @@ from typing import Optional, List
 from fastapi.middleware.cors import CORSMiddleware
 import os, time, uuid, math, logging
 import asyncpg
-import openai
+from openai import AsyncOpenAI
 from contextlib import asynccontextmanager
 
 # Environment configuration
@@ -22,10 +22,12 @@ logger = logging.getLogger(__name__)
 # Global variables for database and embedding model
 db_pool = None
 embedding_model = None
+openai_client = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_pool, embedding_model
+    global db_pool, embedding_model, openai_client
+    logger.info("Starting gardener service...")
     
     # Initialize database connection
     if DATABASE_URL:
@@ -60,16 +62,18 @@ async def lifespan(app: FastAPI):
     # Initialize embedding model
     try:
         if USE_OPENAI and OPENAI_API_KEY:
-            openai.api_key = OPENAI_API_KEY
+            openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
             logger.info("OpenAI embeddings initialized")
         else:
             logger.info("Using fallback embeddings (set USE_OPENAI=true for better results)")
     except Exception as e:
         logger.error(f"Embedding model initialization failed: {e}")
     
+    logger.info("Gardener service startup complete")
     yield
     
     # Cleanup
+    logger.info("Shutting down gardener service...")
     if db_pool:
         await db_pool.close()
 
@@ -89,12 +93,12 @@ TOPICS = {} # id -> {label, centroid, updated}
 async def embed(text: str) -> List[float]:
     """Generate embeddings using OpenAI or fallback"""
     try:
-        if USE_OPENAI and OPENAI_API_KEY:
-            response = await openai.Embedding.acreate(
+        if USE_OPENAI and openai_client:
+            response = await openai_client.embeddings.create(
                 model="text-embedding-3-small",
                 input=text
             )
-            return response['data'][0]['embedding']
+            return response.data[0].embedding
         else:
             # Fallback to deterministic fake embeddings
             import hashlib, random
@@ -122,11 +126,16 @@ class Turn(BaseModel):
 
 @app.get("/health")
 def health(): 
-    return {
-        "ok": True, 
-        "database": "connected" if db_pool else "memory",
-        "embedding": "openai" if USE_OPENAI else "fallback"
-    }
+    try:
+        return {
+            "ok": True, 
+            "database": "connected" if db_pool else "memory",
+            "embedding": "openai" if (USE_OPENAI and openai_client) else "fallback",
+            "cors_origins": CORS_ORIGINS
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {"ok": False, "error": str(e)}
 
 @app.get("/topics")
 async def list_topics():
