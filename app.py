@@ -13,6 +13,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 USE_OPENAI = os.getenv("USE_OPENAI", "false").lower() == "true"
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -75,7 +76,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    allow_credentials=True
 )
 
 # Fallback in-memory stores for development
