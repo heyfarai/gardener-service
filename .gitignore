@@ -38,6 +38,7 @@ venv.bak/
 
 # OS
 .DS_Store
+gardener.db
 .DS_Store?
 ._*
 .Spotlight-V100
