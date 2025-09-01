@@ -55,7 +55,14 @@ async def init_db():
                 await connection.execute('DROP TABLE IF EXISTS snippets CASCADE')
                 await connection.execute('DROP TABLE IF EXISTS topics CASCADE')
                 
-                await connection.execute('CREATE EXTENSION IF NOT EXISTS vector;')
+                # Try to create the vector extension, but continue if it fails
+                try:
+                    await connection.execute('CREATE EXTENSION IF NOT EXISTS vector;')
+                    logger.info("Vector extension created or already exists")
+                except Exception as e:
+                    logger.warning(f"Could not create vector extension: {e}")
+                    logger.warning("Continuing without vector extension - some features may be limited")
+                # First, create tables without vector columns
                 await connection.execute("""
                     CREATE TABLE topics (
                         id SERIAL PRIMARY KEY,
@@ -66,7 +73,7 @@ async def init_db():
                         keywords TEXT,
                         blurb TEXT,
                         num_snippets INTEGER DEFAULT 0,
-                        centroid VECTOR(384),
+                        centroid BYTEA,  -- Store embeddings as bytes if vector extension is not available
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                     );
@@ -76,10 +83,19 @@ async def init_db():
                         id SERIAL PRIMARY KEY,
                         topic_id VARCHAR(255) REFERENCES topics(topic_id) ON DELETE CASCADE,
                         text TEXT NOT NULL,
-                        embedding VECTOR(384),
+                        embedding BYTEA,  -- Store embeddings as bytes if vector extension is not available
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+                
+                # Try to alter the tables to use vector type if the extension is available
+                try:
+                    await connection.execute('ALTER TABLE topics ALTER COLUMN centroid TYPE VECTOR(384) USING centroid::VECTOR;')
+                    await connection.execute('ALTER TABLE snippets ALTER COLUMN embedding TYPE VECTOR(384) USING embedding::VECTOR;')
+                    logger.info("Successfully converted columns to VECTOR type")
+                except Exception as e:
+                    logger.warning(f"Could not convert columns to VECTOR type: {e}")
+                    logger.warning("Using BYTEA for vector storage - some features may be limited")
         else:
             # SQLite: Store embeddings as BLOBs
             await db_pool.execute('DROP TABLE IF EXISTS snippets')
