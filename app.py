@@ -3,6 +3,7 @@ import time
 import uuid
 import math
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
@@ -42,8 +43,18 @@ async def lifespan(app: FastAPI):
     # Initialize database connection
     if DATABASE_URL and DATABASE_URL.strip():
         try:
-            db_pool = await asyncpg.create_pool(DATABASE_URL)
-            logger.info("Database connection established")
+            db_pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=10,
+                max_queries=50000,
+                max_inactive_connection_lifetime=300,  # 5 minutes
+                command_timeout=60,
+                server_settings={
+                    'jit': 'off'
+                }
+            )
+            logger.info("Database connection pool established")
             
             async with db_pool.acquire() as conn:
                 await conn.execute("""
@@ -193,9 +204,13 @@ async def topics():
         logger.info("Fetching all topics")
         
         if db_pool:
-            async with db_pool.acquire() as conn:
-                ts = await conn.fetch("SELECT id, label, updated FROM topics ORDER BY updated DESC")
-                result = [{"id": t["id"], "label": t["label"], "updated": t["updated"].isoformat()} for t in ts]
+            try:
+                async with await get_db_connection() as conn:
+                    ts = await conn.fetch("SELECT id, label, updated FROM topics ORDER BY updated DESC")
+                    result = [{"id": t["id"], "label": t["label"], "updated": t["updated"].isoformat()} for t in ts]
+            except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError) as e:
+                logger.error(f"Database connection failed during topics fetch: {e}")
+                raise HTTPException(503, "Database temporarily unavailable")
         else:
             result = [{"id": tid, "label": meta["label"], "updated": meta["updated"]} for tid,meta in TOPICS.items()]
         
@@ -236,54 +251,76 @@ async def turn(t: Turn, authorization: Optional[str] = Header(None)):
         logger.error(f"Error processing turn for chat_id {t.chat_id}: {e}")
         raise HTTPException(500, f"Internal server error: {str(e)}")
 
+async def get_db_connection():
+    """Get database connection with retry logic"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return db_pool.acquire()
+        except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError) as e:
+            if attempt == max_retries - 1:
+                raise
+            logger.warning(f"Database connection attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(0.5 * (attempt + 1))
+
 async def process_text_db(text: str, v: List[float], chat_id: str, ts: str):
     """Process text using database storage"""
-    try:
-        async with db_pool.acquire() as conn:
-            # Find nearest topic
-            topics = await conn.fetch("SELECT id, label, centroid FROM topics")
-            best_id, best_score = None, 0.0
-            
-            for topic in topics:
-                centroid = topic['centroid']
-                score = cosine_similarity(v, centroid)
-                if score > best_score:
-                    best_score = score
-                    best_id = topic['id']
-            
-            # Create new topic if similarity too low
-            if best_id is None or best_score < 0.78:
-                label = " ".join(text.split()[:4]).strip(" ,.") or f"Topic {len(topics)+1}"
-                best_id = f"topic_{uuid.uuid4().hex[:6]}"
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with await get_db_connection() as conn:
+                # Find nearest topic
+                topics = await conn.fetch("SELECT id, label, centroid FROM topics")
+                best_id, best_score = None, 0.0
+                
+                for topic in topics:
+                    centroid = topic['centroid']
+                    score = cosine_similarity(v, centroid)
+                    if score > best_score:
+                        best_score = score
+                        best_id = topic['id']
+                
+                # Create new topic if similarity too low
+                if best_id is None or best_score < 0.78:
+                    label = " ".join(text.split()[:4]).strip(" ,.") or f"Topic {len(topics)+1}"
+                    best_id = f"topic_{uuid.uuid4().hex[:6]}"
+                    await conn.execute(
+                        "INSERT INTO topics (id, label, centroid) VALUES ($1, $2, $3)",
+                        best_id, label, v
+                    )
+                    logger.info(f"Created new topic: {best_id} - {label}")
+                else:
+                    # Update centroid with EMA (alpha=0.1)
+                    old_centroid = await conn.fetchval(
+                        "SELECT centroid FROM topics WHERE id = $1", best_id
+                    )
+                    alpha = 0.1
+                    new_centroid = [(1-alpha)*old_centroid[i] + alpha*v[i] for i in range(len(v))]
+                    await conn.execute(
+                        "UPDATE topics SET centroid = $1, updated = NOW() WHERE id = $2",
+                        new_centroid, best_id
+                    )
+                    logger.debug(f"Updated topic centroid: {best_id}")
+                
+                # Store snippet
+                sid = f"s_{uuid.uuid4().hex[:6]}"
                 await conn.execute(
-                    "INSERT INTO topics (id, label, centroid) VALUES ($1, $2, $3)",
-                    best_id, label, v
+                    "INSERT INTO snippets (id, chat_id, ts, text, embedding, topic_id) VALUES ($1, $2, $3, $4, $5, $6)",
+                    sid, chat_id, ts, text, v, best_id
                 )
-                logger.info(f"Created new topic: {best_id} - {label}")
-            else:
-                # Update centroid with EMA (alpha=0.1)
-                old_centroid = await conn.fetchval(
-                    "SELECT centroid FROM topics WHERE id = $1", best_id
-                )
-                alpha = 0.1
-                new_centroid = [(1-alpha)*old_centroid[i] + alpha*v[i] for i in range(len(v))]
-                await conn.execute(
-                    "UPDATE topics SET centroid = $1, updated = NOW() WHERE id = $2",
-                    new_centroid, best_id
-                )
-                logger.debug(f"Updated topic centroid: {best_id}")
-            
-            # Store snippet
-            sid = f"s_{uuid.uuid4().hex[:6]}"
-            await conn.execute(
-                "INSERT INTO snippets (id, chat_id, ts, text, embedding, topic_id) VALUES ($1, $2, $3, $4, $5, $6)",
-                sid, chat_id, ts, text, v, best_id
-            )
-            logger.debug(f"Stored snippet: {sid} in topic: {best_id}")
-    
-    except Exception as e:
-        logger.error(f"Database processing error: {e}")
-        raise
+                logger.debug(f"Stored snippet: {sid} in topic: {best_id}")
+                return  # Success, exit retry loop
+        
+        except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError, asyncpg.InternalClientError) as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Database processing failed after {max_retries} attempts: {e}")
+                raise
+            logger.warning(f"Database connection lost, retrying ({attempt + 1}/{max_retries}): {e}")
+            await asyncio.sleep(0.5 * (attempt + 1))
+        
+        except Exception as e:
+            logger.error(f"Database processing error: {e}")
+            raise
 
 async def process_text_memory(text: str, v: List[float], chat_id: str, ts: str):
     """Process text using in-memory storage (fallback)"""
@@ -315,9 +352,13 @@ async def search(q: str, k: int = 8):
         v = embed(q)
         
         if db_pool:
-            async with db_pool.acquire() as conn:
-                topics = await conn.fetch("SELECT id, label, centroid FROM topics")
-                scored = [(t['id'], t['label'], cosine_similarity(v, t['centroid'])) for t in topics]
+            try:
+                async with await get_db_connection() as conn:
+                    topics = await conn.fetch("SELECT id, label, centroid FROM topics")
+                    scored = [(t['id'], t['label'], cosine_similarity(v, t['centroid'])) for t in topics]
+            except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError) as e:
+                logger.error(f"Database connection failed during search: {e}")
+                raise HTTPException(503, "Database temporarily unavailable")
         else:
             scored = [(tid, meta["label"], cosine_similarity(v, meta["centroid"])) for tid,meta in TOPICS.items()]
         
@@ -339,24 +380,28 @@ async def brief(topic_id: str, max_tokens: int = 600):
         logger.info(f"Generating brief for topic: {topic_id}")
         
         if db_pool:
-            async with db_pool.acquire() as conn:
-                topic = await conn.fetchrow("SELECT * FROM topics WHERE id = $1", topic_id)
-                if not topic:
-                    raise HTTPException(404, f"Topic {topic_id} not found")
-                
-                snippets = await conn.fetch(
-                    "SELECT text, embedding FROM snippets WHERE topic_id = $1", topic_id
-                )
-                sims = [(s['text'], cosine_similarity(s['embedding'], topic['centroid'])) for s in snippets]
-                sims.sort(key=lambda x: x[1], reverse=True)
-                picks = [text for text, _ in sims[:5]]
-                
-                return {
-                    "id": topic_id, 
-                    "label": topic["label"], 
-                    "summary_markdown": " • ".join(picks)[:max_tokens*4], 
-                    "updated": topic["updated"].isoformat()
-                }
+            try:
+                async with await get_db_connection() as conn:
+                    topic = await conn.fetchrow("SELECT * FROM topics WHERE id = $1", topic_id)
+                    if not topic:
+                        raise HTTPException(404, f"Topic {topic_id} not found")
+                    
+                    snippets = await conn.fetch(
+                        "SELECT text, embedding FROM snippets WHERE topic_id = $1", topic_id
+                    )
+                    sims = [(s['text'], cosine_similarity(s['embedding'], topic['centroid'])) for s in snippets]
+                    sims.sort(key=lambda x: x[1], reverse=True)
+                    picks = [text for text, _ in sims[:5]]
+                    
+                    return {
+                        "id": topic_id, 
+                        "label": topic["label"], 
+                        "summary_markdown": " • ".join(picks)[:max_tokens*4], 
+                        "updated": topic["updated"].isoformat()
+                    }
+            except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError) as e:
+                logger.error(f"Database connection failed during brief generation: {e}")
+                raise HTTPException(503, "Database temporarily unavailable")
         else:
             topic = TOPICS.get(topic_id)
             if not topic:
@@ -387,23 +432,27 @@ async def retrieve(r: RetrieveReq):
         query_vec = embed(r.query) if r.query else None
         
         if db_pool:
-            async with db_pool.acquire() as conn:
-                if r.topic_id:
-                    topic_vec = await conn.fetchval(
-                        "SELECT centroid FROM topics WHERE id = $1", r.topic_id
+            try:
+                async with await get_db_connection() as conn:
+                    if r.topic_id:
+                        topic_vec = await conn.fetchval(
+                            "SELECT centroid FROM topics WHERE id = $1", r.topic_id
+                        )
+                        if topic_vec is None:
+                            raise HTTPException(404, f"Topic {r.topic_id} not found")
+                    
+                    snippets = await conn.fetch(
+                        "SELECT id, text, chat_id, embedding FROM snippets"
                     )
-                    if topic_vec is None:
-                        raise HTTPException(404, f"Topic {r.topic_id} not found")
-                
-                snippets = await conn.fetch(
-                    "SELECT id, text, chat_id, embedding FROM snippets"
-                )
-                scored = []
-                for s in snippets:
-                    score = 0.0
-                    if topic_vec: score += 0.6 * cosine_similarity(s['embedding'], topic_vec)
-                    if query_vec: score += 0.4 * cosine_similarity(s['embedding'], query_vec)
-                    scored.append((s, score))
+                    scored = []
+                    for s in snippets:
+                        score = 0.0
+                        if topic_vec: score += 0.6 * cosine_similarity(s['embedding'], topic_vec)
+                        if query_vec: score += 0.4 * cosine_similarity(s['embedding'], query_vec)
+                        scored.append((s, score))
+            except (asyncpg.ConnectionDoesNotExistError, asyncpg.InterfaceError) as e:
+                logger.error(f"Database connection failed during retrieval: {e}")
+                raise HTTPException(503, "Database temporarily unavailable")
         else:
             if r.topic_id and r.topic_id not in TOPICS:
                 raise HTTPException(404, f"Topic {r.topic_id} not found")
