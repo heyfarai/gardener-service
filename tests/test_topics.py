@@ -45,8 +45,8 @@ async def test_get_topic_brief_success(test_client: AsyncClient):
     
     # Get the latest topic ID from the database
     db = get_db_pool()
-    cursor = await db.execute("SELECT topic_id FROM topics ORDER BY created_at DESC LIMIT 1")
-    topic = await cursor.fetchone()
+    async with db.acquire() as conn:
+        topic = await conn.fetchrow("SELECT topic_id FROM topics ORDER BY created_at DESC LIMIT 1")
     assert topic is not None, "No topics found in the database"
     topic_id = topic["topic_id"]
     

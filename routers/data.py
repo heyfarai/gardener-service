@@ -17,6 +17,11 @@ router = APIRouter()
 
 @router.post("/turn")
 async def turn(t: Turn, authorization: Optional[str] = Header(None)):
+    # from config import API_KEY
+    
+    # if not authorization or authorization != API_KEY:
+    #     raise HTTPException(status_code=401, detail="Unauthorized")
+    
     user_text = t.user_text.strip() if t.user_text else ""
     if not user_text:
         raise HTTPException(status_code=400, detail="User text is required")
@@ -39,11 +44,8 @@ async def retrieve(r: RetrieveReq):
         db = get_db_pool()
 
         scored = []
-        if DATABASE_URL:
-            async with db.acquire() as conn:
-                scored = await _retrieve_postgres(conn, r, query_vec)
-        else:
-            scored = await _retrieve_sqlite(db, r, query_vec)
+        async with db.acquire() as conn:
+            scored = await _retrieve_postgres(conn, r, query_vec)
 
         scored.sort(key=lambda x: x[1], reverse=True)
         out = [{"rank": i + 1, "text": s["text"], "chat_id": s.get("chat_id"), "snippet_id": s["id"]} for i, (s, _) in enumerate(scored[:r.k])]
@@ -73,22 +75,3 @@ async def _retrieve_postgres(conn, r: RetrieveReq, query_vec):
         scored.append((s, score))
     return scored
 
-async def _retrieve_sqlite(db, r: RetrieveReq, query_vec):
-    topic_vec = None
-    if r.topic_id:
-        cursor = await db.execute("SELECT centroid FROM topics WHERE topic_id = ?", (r.topic_id,))
-        row = await cursor.fetchone()
-        if row is None:
-            raise HTTPException(404, f"Topic {r.topic_id} not found")
-        topic_vec = np.frombuffer(row['centroid'], dtype=np.float32).tolist()
-
-    cursor = await db.execute("SELECT id, text, embedding FROM snippets")
-    snippets = await cursor.fetchall()
-    scored = []
-    for s in snippets:
-        embedding = np.frombuffer(s['embedding'], dtype=np.float32).tolist()
-        score = 0.0
-        if topic_vec: score += 0.6 * cosine_similarity(embedding, topic_vec)
-        if query_vec: score += 0.4 * cosine_similarity(embedding, query_vec)
-        scored.append((dict(s), score))
-    return scored

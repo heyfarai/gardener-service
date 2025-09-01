@@ -11,14 +11,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from app import app
 from database import get_db_pool, close_pool, create_pool, init_db
 
-# Use in-memory SQLite for tests
-TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
-
+# Use PostgreSQL for tests - requires DATABASE_URL to be set
 @pytest_asyncio.fixture(scope="function")
 async def test_db():
     """Set up test database with tables."""
-    # Create a new in-memory database for each test
-    os.environ["DATABASE_URL"] = ""  # Empty to force SQLite
+    # Ensure DATABASE_URL is set for tests
+    if not os.environ.get("DATABASE_URL"):
+        pytest.skip("DATABASE_URL not set - PostgreSQL required for tests")
     
     # Create and initialize the database
     await create_pool()
@@ -33,8 +32,6 @@ async def test_db():
     
     # Clean up
     await close_pool()
-    if os.path.exists("test.db"):
-        os.remove("test.db")
 
 @pytest_asyncio.fixture(scope="function")
 async def test_client(test_db):

@@ -56,17 +56,21 @@ async def search(q: str, k: int = 8):
         scored = [(tid, meta["label"], cosine_similarity(v, meta["centroid"])) for tid, meta in TOPICS.items()]
     else:
         try:
-            if DATABASE_URL:
-                async with db.acquire() as conn:
-                    topics = await conn.fetch("SELECT id, label, centroid <-> $1 AS distance FROM topics ORDER BY distance LIMIT $2", v, k)
-                    scored = [(t['id'], t['label'], 1 - t['distance']) for t in topics]
-            else:
-                cursor = await db.execute("SELECT id, label, centroid FROM topics")
-                topics = await cursor.fetchall()
-                scored = []
-                for t in topics:
-                    centroid = np.frombuffer(t['centroid'], dtype=np.float32).tolist()
-                    scored.append((t['id'], t['label'], cosine_similarity(v, centroid)))
+            async with db.acquire() as conn:
+                # Try VECTOR operations first, fallback to BYTEA
+                try:
+                    topics = await conn.fetch("SELECT topic_id, label, centroid <-> $1 AS distance FROM topics ORDER BY distance LIMIT $2", v, k)
+                    scored = [(t['topic_id'], t['label'], 1 - t['distance']) for t in topics]
+                except Exception:
+                    # Fallback for BYTEA storage
+                    import numpy as np
+                    topics = await conn.fetch("SELECT topic_id, label, centroid FROM topics")
+                    scored = []
+                    for t in topics:
+                        if t['centroid']:
+                            centroid = np.frombuffer(t['centroid'], dtype=np.float32).tolist()
+                            similarity = cosine_similarity(v, centroid)
+                            scored.append((t['topic_id'], t['label'], similarity))
         except Exception as e:
             logger.error(f"Database connection failed during search: {e}")
             raise HTTPException(503, "Database temporarily unavailable")
@@ -95,11 +99,8 @@ async def brief(topic_id: str, max_tokens: int = 600):
         return {"id": topic_id, "label": topic["label"], "summary_markdown": txt, "updated": topic["updated_at"]}
 
     try:
-        if DATABASE_URL:
-            async with db.acquire() as conn:
-                return await _get_brief_postgres(conn, topic_id, max_tokens)
-        else:
-            return await _get_brief_sqlite(db, topic_id, max_tokens)
+        async with db.acquire() as conn:
+            return await _get_brief_postgres(conn, topic_id, max_tokens)
     except HTTPException:
         raise
     except Exception as e:
@@ -107,14 +108,38 @@ async def brief(topic_id: str, max_tokens: int = 600):
         raise HTTPException(500, f"Brief generation failed: {str(e)}")
 
 async def _get_brief_postgres(conn, topic_id: str, max_tokens: int):
-    topic = await conn.fetchrow("SELECT * FROM topics WHERE id = $1", topic_id)
+    topic = await conn.fetchrow("SELECT * FROM topics WHERE topic_id = $1", topic_id)
     if not topic:
         raise HTTPException(404, f"Topic {topic_id} not found")
 
-    snippets = await conn.fetch(
-        "SELECT text, embedding <-> $1 AS distance FROM snippets WHERE topic_id = $2 ORDER BY distance LIMIT 5",
-        topic['centroid'], topic_id
-    )
+    # Handle both VECTOR and BYTEA storage for snippets
+    try:
+        snippets = await conn.fetch(
+            "SELECT text, embedding <-> $1 AS distance FROM snippets WHERE topic_id = $2 ORDER BY distance LIMIT 5",
+            topic['centroid'], topic_id
+        )
+    except Exception:
+        # Fallback for BYTEA storage - get all snippets and sort manually
+        import numpy as np
+        from services.utils import cosine_similarity
+        
+        all_snippets = await conn.fetch(
+            "SELECT text, embedding FROM snippets WHERE topic_id = $1", topic_id
+        )
+        
+        if topic['centroid']:
+            centroid = np.frombuffer(topic['centroid'], dtype=np.float32).tolist()
+            snippet_distances = []
+            for snippet in all_snippets:
+                if snippet['embedding']:
+                    embedding = np.frombuffer(snippet['embedding'], dtype=np.float32).tolist()
+                    distance = 1 - cosine_similarity(centroid, embedding)
+                    snippet_distances.append((snippet['text'], distance))
+            
+            snippet_distances.sort(key=lambda x: x[1])
+            snippets = [{'text': text, 'distance': dist} for text, dist in snippet_distances[:5]]
+        else:
+            snippets = [{'text': s['text'], 'distance': 0} for s in all_snippets[:5]]
     picks = [s['text'] for s in snippets]
 
     return {
@@ -124,46 +149,3 @@ async def _get_brief_postgres(conn, topic_id: str, max_tokens: int):
         "updated": topic["updated_at"].isoformat()
     }
 
-async def _get_brief_sqlite(db, topic_id: str, max_tokens: int):
-    logger.info(f"Fetching topic with topic_id: {topic_id}")
-    cursor = await db.execute("SELECT * FROM topics WHERE topic_id = ?", (topic_id,))
-    topic = await cursor.fetchone()
-    if not topic:
-        # Log all available topics for debugging
-        cursor = await db.execute("SELECT topic_id FROM topics")
-        all_topics = await cursor.fetchall()
-        logger.warning(f"Topic {topic_id} not found. Available topics: {[t['topic_id'] for t in all_topics]}")
-        raise HTTPException(404, f"Topic {topic_id} not found")
-
-    topic_centroid = np.frombuffer(topic['centroid'], dtype=np.float32).tolist() if topic['centroid'] else None
-    if not topic_centroid:
-        return {
-            "id": topic_id,
-            "label": topic["label"] if "label" in topic else "",
-            "summary_markdown": "No snippets available for this topic.",
-            "updated": topic["updated_at"] if "updated_at" in topic else ""
-        }
-
-    cursor = await db.execute("SELECT text, embedding FROM snippets WHERE topic_id = ?", (topic_id,))
-    snippets = await cursor.fetchall()
-
-    sims = []
-    for s in snippets:
-        if not s['embedding']:
-            continue
-        try:
-            embedding = np.frombuffer(s['embedding'], dtype=np.float32).tolist()
-            sims.append((s['text'], cosine_similarity(embedding, topic_centroid)))
-        except Exception as e:
-            logger.warning(f"Error processing snippet embedding: {e}")
-            continue
-
-    sims.sort(key=lambda x: x[1], reverse=True)
-    picks = [text for text, _ in sims[:5]]
-
-    return {
-        "id": topic_id,
-        "label": topic["label"] if "label" in topic else "",
-        "summary_markdown": " • ".join(picks)[:max_tokens * 4] if picks else "No snippets available for this topic.",
-        "updated": topic["updated_at"] if "updated_at" in topic else ""
-    }

@@ -3,8 +3,8 @@ import logging
 import hashlib
 import random
 import numpy as np
-from typing import List, Dict, Any, Optional
-from config import USE_OPENAI, OPENAI_API_KEY, DATABASE_URL
+from typing import List, Dict, Any
+from config import USE_OPENAI, OPENAI_API_KEY
 from database import get_db_pool
 
 logger = logging.getLogger(__name__)
@@ -42,16 +42,13 @@ async def store_embedding(text: str, embedding: List[float], topic_id: str = Non
         return -1
 
     try:
-        if DATABASE_URL:
-            async with db.acquire() as conn:
-                # Try to insert as VECTOR first, fall back to BYTEA if that fails
-                try:
-                    return await _store_embedding_postgres(conn, text, embedding, topic_id, chat_id, ts, use_vector=True)
-                except Exception as e:
-                    logger.warning(f"Failed to store as VECTOR, falling back to BYTEA: {e}")
-                    return await _store_embedding_postgres(conn, text, embedding, topic_id, chat_id, ts, use_vector=False)
-        else:
-            return await _store_embedding_sqlite(db, text, embedding, topic_id, chat_id, ts)
+        async with db.acquire() as conn:
+            # Try to insert as VECTOR first, fall back to BYTEA if that fails
+            try:
+                return await _store_embedding_postgres(conn, text, embedding, topic_id, chat_id, ts, use_vector=True)
+            except Exception as e:
+                logger.warning(f"Failed to store as VECTOR, falling back to BYTEA: {e}")
+                return await _store_embedding_postgres(conn, text, embedding, topic_id, chat_id, ts, use_vector=False)
     except Exception as e:
         logger.error(f"Error storing embedding: {e}")
         return -1
@@ -93,22 +90,6 @@ async def _store_embedding_postgres(conn, text: str, embedding: List[float], top
         raise
 
 
-async def _store_embedding_sqlite(db, text: str, embedding: List[float], topic_id: str = None, 
-                                 chat_id: str = None, ts: str = None) -> int:
-    """Store embedding in SQLite database."""
-    # Convert embedding to bytes for storage
-    embedding_bytes = np.array(embedding, dtype=np.float32).tobytes()
-    
-    query = """
-        INSERT INTO snippets (topic_id, text, embedding, chat_id, ts)
-        VALUES (?, ?, ?, ?, ?)
-    """
-    cursor = await db.execute(
-        query,
-        (topic_id, text, embedding_bytes, chat_id, ts)
-    )
-    await db.commit()
-    return cursor.lastrowid
 
 
 async def get_similar_embeddings(embedding: List[float], limit: int = 5, topic_id: str = None) -> List[Dict[str, Any]]:
@@ -118,27 +99,24 @@ async def get_similar_embeddings(embedding: List[float], limit: int = 5, topic_i
         return []
 
     try:
-        if DATABASE_URL:
-            async with db.acquire() as conn:
-                # First try with vector similarity
-                try:
-                    query = """
-                        SELECT id, text, 1 - (embedding <=> $1::vector) as similarity
-                        FROM snippets
-                        WHERE ($2::text IS NULL OR topic_id = $2)
-                        ORDER BY embedding <=> $1::vector
-                        LIMIT $3
-                    """
-                    results = await conn.fetch(query, embedding, topic_id, limit)
-                    return [dict(r) for r in results]
-                except Exception as e:
-                    if 'operator does not exist' in str(e) and 'vector' in str(e):
-                        # Fall back to BYTEA comparison if vector operations fail
-                        logger.warning("Vector operations not available, using BYTEA comparison")
-                        return await _get_similar_embeddings_bytea(conn, embedding, limit, topic_id)
-                    raise
-        else:
-            return await _get_similar_embeddings_sqlite(db, embedding, limit, topic_id)
+        async with db.acquire() as conn:
+            # First try with vector similarity
+            try:
+                query = """
+                    SELECT id, text, 1 - (embedding <=> $1::vector) as similarity
+                    FROM snippets
+                    WHERE ($2::text IS NULL OR topic_id = $2)
+                    ORDER BY embedding <=> $1::vector
+                    LIMIT $3
+                """
+                results = await conn.fetch(query, embedding, topic_id, limit)
+                return [dict(r) for r in results]
+            except Exception as e:
+                if 'operator does not exist' in str(e) and 'vector' in str(e):
+                    # Fall back to BYTEA comparison if vector operations fail
+                    logger.warning("Vector operations not available, using BYTEA comparison")
+                    return await _get_similar_embeddings_bytea(conn, embedding, limit, topic_id)
+                raise
     except Exception as e:
         logger.error(f"Error finding similar embeddings: {e}")
         return []
@@ -180,38 +158,3 @@ async def _get_similar_embeddings_bytea(conn, embedding: List[float], limit: int
     return results[:limit]
 
 
-async def _get_similar_embeddings_sqlite(db, embedding: List[float], limit: int = 5, topic_id: str = None) -> List[Dict[str, Any]]:
-    """Find similar embeddings in SQLite database."""
-    from scipy.spatial.distance import cosine
-    
-    # Convert input embedding to numpy array
-    query_embedding = np.array(embedding, dtype=np.float32)
-    
-    # Get all relevant embeddings from the database
-    query = """
-        SELECT id, text, embedding
-        FROM snippets
-        WHERE (? IS NULL OR topic_id = ?)
-    """
-    cursor = await db.execute(query, (topic_id, topic_id))
-    rows = await cursor.fetchall()
-    
-    # Calculate similarities
-    results = []
-    for row in rows:
-        try:
-            # Convert BLOB to numpy array
-            db_embedding = np.frombuffer(row['embedding'], dtype=np.float32)
-            # Calculate cosine similarity (1 - cosine distance)
-            similarity = 1 - cosine(query_embedding, db_embedding)
-            results.append({
-                'id': row['id'],
-                'text': row['text'],
-                'similarity': float(similarity)
-            })
-        except Exception as e:
-            logger.warning(f"Error processing embedding {row['id']}: {e}")
-    
-    # Sort by similarity and return top results
-    results.sort(key=lambda x: -x['similarity'])
-    return results[:limit]

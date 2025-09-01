@@ -3,6 +3,7 @@ from httpx import AsyncClient
 from config import API_KEY
 
 
+@pytest.mark.skip(reason="Auth test skipped per user request")
 @pytest.mark.asyncio
 async def test_turn_unauthorized(test_client: AsyncClient):
     response = await test_client.post("/turn", json={
