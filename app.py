@@ -67,11 +67,7 @@ async def lifespan(app: FastAPI):
     try:
         if USE_OPENAI and OPENAI_API_KEY:
             logger.info("Attempting to initialize OpenAI client...")
-            openai_client = AsyncOpenAI(
-                api_key=OPENAI_API_KEY,
-                timeout=30.0,  # Add explicit timeout
-                max_retries=2   # Reduce retries during startup
-            )
+            openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
             logger.info("OpenAI embeddings initialized successfully")
         else:
             logger.info("Using fallback embeddings (set USE_OPENAI=true for better results)")
