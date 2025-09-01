@@ -67,7 +67,11 @@ async def lifespan(app: FastAPI):
     try:
         if USE_OPENAI and OPENAI_API_KEY:
             logger.info("Attempting to initialize OpenAI client...")
-            openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+            openai_client = AsyncOpenAI(
+                api_key=OPENAI_API_KEY,
+                timeout=30.0,  # Add explicit timeout
+                max_retries=2   # Reduce retries during startup
+            )
             logger.info("OpenAI embeddings initialized successfully")
         else:
             logger.info("Using fallback embeddings (set USE_OPENAI=true for better results)")
@@ -139,7 +143,12 @@ def health():
     return {
         "status": "healthy",
         "database": "connected" if db_pool else "memory",
-        "embedding": "openai" if (USE_OPENAI and openai_client) else "fallback"
+        "embedding": "openai" if (USE_OPENAI and OPENAI_API_KEY and openai_client) else "fallback",
+        "debug": {
+            "USE_OPENAI": USE_OPENAI,
+            "has_api_key": bool(OPENAI_API_KEY),
+            "client_initialized": openai_client is not None
+        }
     }
 
 @app.get("/topics")
