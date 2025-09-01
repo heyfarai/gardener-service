@@ -63,14 +63,16 @@ async def lifespan(app: FastAPI):
         logger.info("Using in-memory storage (no DATABASE_URL provided)")
     
     # Initialize embedding model
+    logger.info(f"Environment check - USE_OPENAI: {USE_OPENAI}, OPENAI_API_KEY present: {bool(OPENAI_API_KEY)}")
     try:
         if USE_OPENAI and OPENAI_API_KEY:
             openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-            logger.info("OpenAI embeddings initialized")
+            logger.info("OpenAI embeddings initialized successfully")
         else:
             logger.info("Using fallback embeddings (set USE_OPENAI=true for better results)")
     except Exception as e:
         logger.error(f"Embedding model initialization failed: {e}")
+        logger.info("Falling back to deterministic embeddings")
     
     logger.info("Gardener service startup complete")
     yield
