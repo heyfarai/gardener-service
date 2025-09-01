@@ -127,6 +127,10 @@ class Turn(BaseModel):
     model: Optional[str] = None
     ts: Optional[str] = None
 
+@app.get("/")
+def root():
+    return {"service": "gardener", "status": "running"}
+
 @app.get("/health")
 def health(): 
     return {
