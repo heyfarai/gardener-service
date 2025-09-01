@@ -17,9 +17,6 @@ router = APIRouter()
 
 @router.post("/turn")
 async def turn(t: Turn, authorization: Optional[str] = Header(None)):
-    if authorization != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
     user_text = t.user_text.strip() if t.user_text else ""
     if not user_text:
         raise HTTPException(status_code=400, detail="User text is required")
