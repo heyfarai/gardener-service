@@ -9,7 +9,7 @@ from httpx import AsyncClient, ASGITransport
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app import app
-from database import get_db_pool, close_pool, create_pool, init_db
+from database import get_db_pool, close_pool, create_pool, init_db, reset_pool
 
 # Use PostgreSQL for tests - requires DATABASE_URL to be set
 @pytest_asyncio.fixture(scope="function")
@@ -27,6 +27,7 @@ async def test_db():
         
     # Initialize the database schema
     await init_db()
+    await reset_pool()
     
     yield pool
     

@@ -33,7 +33,7 @@ def embed(text: str) -> List[float]:
     # Fallback to deterministic embeddings
     seed = int(hashlib.md5(text.encode()).hexdigest(), 16) % 10**6
     random.seed(seed)
-    return [random.random() for _ in range(384)]
+    return [random.random() for _ in range(1536)]
 
 async def store_embedding(text: str, embedding: List[float], topic_id: str = None, chat_id: str = None, ts: str = None) -> int:
     """Store text and its embedding in the database."""
@@ -156,5 +156,3 @@ async def _get_similar_embeddings_bytea(conn, embedding: List[float], limit: int
     # Sort by similarity and return top results
     results.sort(key=lambda x: -x['similarity'])
     return results[:limit]
-
-

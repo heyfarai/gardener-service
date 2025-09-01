@@ -1,5 +1,6 @@
 import asyncpg
 import logging
+import os
 from config import DATABASE_URL
 
 logger = logging.getLogger(__name__)
@@ -12,17 +13,23 @@ async def create_pool():
     global db_pool
     if db_pool:
         return
-
+    
+    # Disable statement cache in test environment
+    statement_cache_size = 0 if os.environ.get("PYTEST_CURRENT_TEST") else 100
+    
     try:
-        if not DATABASE_URL:
-            raise ValueError("DATABASE_URL is required - SQLite support has been removed")
-        
         logger.info("Connecting to PostgreSQL database...")
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL, 
+            min_size=1, 
+            max_size=10,
+            statement_cache_size=statement_cache_size
+        )
+        
         logger.info("PostgreSQL connection pool established.")
     except Exception as e:
-        logger.error(f"Database connection failed: {e}")
-        db_pool = None
+        logger.error(f"Failed to create PostgreSQL connection pool: {e}")
+        raise
 
 async def close_pool():
     """Close the database connection pool."""
@@ -32,34 +39,36 @@ async def close_pool():
         db_pool = None
         logger.info("Database connection pool closed.")
 
+async def reset_pool():
+    """Reset the database connection pool."""
+    global db_pool
+    if db_pool:
+        await close_pool()
+    await create_pool()
+    logger.info("Database connection pool reset.")
+
 def get_db_pool():
     """Get the database connection pool."""
     return db_pool
 
 async def init_db():
     """Initialize the database by creating tables if they don't exist."""
+    global db_pool
     if not db_pool:
         logger.error("Database pool not available, cannot initialize DB.")
         return
 
     try:
-        # PostgreSQL: Use pgvector for embeddings
         async with db_pool.acquire() as connection:
             # Drop existing tables if they exist
             await connection.execute('DROP TABLE IF EXISTS snippets CASCADE')
             await connection.execute('DROP TABLE IF EXISTS topics CASCADE')
             
-            # Try to create the vector extension, but continue if it fails
-            vector_available = False
-            try:
-                await connection.execute('CREATE EXTENSION IF NOT EXISTS vector;')
-                logger.info("Vector extension created or already exists")
-                vector_available = True
-            except Exception as e:
-                logger.warning(f"Could not create vector extension: {e}")
-                logger.warning("Continuing without vector extension - some features may be limited")
+            # Create vector extension
+            await connection.execute('CREATE EXTENSION IF NOT EXISTS vector;')
+            logger.info("Vector extension created")
             
-            # First, create tables without vector columns
+            # Create tables with VECTOR columns directly
             await connection.execute("""
                 CREATE TABLE topics (
                     id SERIAL PRIMARY KEY,
@@ -69,37 +78,28 @@ async def init_db():
                     label_confidence FLOAT,
                     keywords TEXT,
                     blurb TEXT,
-                    num_snippets INTEGER DEFAULT 0,
-                    centroid BYTEA,  -- Store embeddings as bytes if vector extension is not available
+                    centroid VECTOR(1536),
+                    num_snippets INT DEFAULT 0,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            
             await connection.execute("""
                 CREATE TABLE snippets (
                     id SERIAL PRIMARY KEY,
                     topic_id VARCHAR(255) REFERENCES topics(topic_id) ON DELETE CASCADE,
                     text TEXT NOT NULL,
-                    embedding BYTEA,  -- Store embeddings as bytes if vector extension is not available
+                    embedding VECTOR(1536),
                     chat_id TEXT,
                     ts TEXT,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-            
-            # Try to alter the tables to use vector type only if the extension is available
-            if vector_available:
-                try:
-                    await connection.execute('ALTER TABLE topics ALTER COLUMN centroid TYPE VECTOR(384) USING centroid::VECTOR;')
-                    await connection.execute('ALTER TABLE snippets ALTER COLUMN embedding TYPE VECTOR(384) USING embedding::VECTOR;')
-                    logger.info("Successfully converted columns to VECTOR type")
-                except Exception as e:
-                    logger.warning(f"Could not convert columns to VECTOR type: {e}")
-                    logger.warning("Using BYTEA for vector storage - some features may be limited")
-            else:
-                logger.info("Vector extension not available - using BYTEA for vector storage")
         
-        logger.info("Database initialized with updated schema.")
+        logger.info("Database initialized with VECTOR schema.")
+        await reset_pool()
+                    
     except Exception as e:
         logger.error(f"Error initializing database: {e}")
         raise

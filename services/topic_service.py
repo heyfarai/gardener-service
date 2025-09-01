@@ -7,6 +7,7 @@ from typing import List
 from datetime import datetime
 
 import numpy as np
+from pgvector.asyncpg import register_vector
 
 from models import TopicStatus
 from services.utils import cosine_similarity
@@ -48,89 +49,54 @@ async def process_text_db(text: str, v: List[float], chat_id: str, ts: str):
         raise
 
 async def _process_text_postgres(conn, text, v, chat_id, ts):
-    """Process text using PostgreSQL with VECTOR/BYTEA fallback."""
-    import numpy as np
-    from services.utils import cosine_similarity
+    """Process text using PostgreSQL with pgvector."""
     
-    # Try VECTOR operations first, fallback to BYTEA
-    try:
-        # Find the closest topic using vector operations
-        topic_record = await conn.fetchrow(
-            "SELECT topic_id, label, centroid FROM topics ORDER BY centroid <=> $1::vector LIMIT 1", v
-        )
-        use_vector = True
-    except Exception:
-        # Fallback to BYTEA operations
-        topic_records = await conn.fetch("SELECT topic_id, label, centroid FROM topics")
-        topic_record = None
-        best_similarity = -1
-        
-        for record in topic_records:
-            if record['centroid']:
-                centroid = np.frombuffer(record['centroid'], dtype=np.float32).tolist()
-                similarity = cosine_similarity(v, centroid)
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                    topic_record = record
-        use_vector = False
+    # Register vector type with connection
+    await register_vector(conn)
+    
+    # Convert list to numpy array for pgvector if it's not already
+    v_array = np.array(v) if not isinstance(v, np.ndarray) else v
+    
+    # Find similar topics using vector similarity
+    similar_topics = await conn.fetch("""
+        SELECT topic_id, label, 1 - (centroid <=> $1) as similarity
+        FROM topics 
+        WHERE centroid IS NOT NULL
+        ORDER BY centroid <=> $1
+        LIMIT 5
+    """, v_array)
 
     topic_id = None
-    if topic_record:
-        if use_vector:
-            # Cosine similarity is 1 - cosine distance
-            similarity = 1 - (await conn.fetchval("SELECT $1::vector <=> $2::vector", v, topic_record['centroid']))
-        else:
-            centroid = np.frombuffer(topic_record['centroid'], dtype=np.float32).tolist()
-            similarity = cosine_similarity(v, centroid)
-            
-        if similarity > 0.8: # Similarity threshold
+    if similar_topics:
+        topic_record = similar_topics[0]
+        similarity = topic_record['similarity']
+        if similarity > 0.8:  # Similarity threshold
             topic_id = topic_record['topic_id']
             # Update topic centroid (EMA)
             alpha = 0.1
-            if use_vector:
-                new_centroid = [(1 - alpha) * c + alpha * v[i] for i, c in enumerate(topic_record['centroid'])]
-                await conn.execute(
-                    "UPDATE topics SET centroid = $1, updated_at = NOW() WHERE topic_id = $2",
-                    new_centroid, topic_id
-                )
-            else:
-                current_centroid = np.frombuffer(topic_record['centroid'], dtype=np.float32).tolist()
-                new_centroid = [(1 - alpha) * c + alpha * v[i] for i, c in enumerate(current_centroid)]
-                new_centroid_blob = np.array(new_centroid, dtype=np.float32).tobytes()
-                await conn.execute(
-                    "UPDATE topics SET centroid = $1, updated_at = NOW() WHERE topic_id = $2",
-                    new_centroid_blob, topic_id
-                )
+            current_centroid = await conn.fetchval("SELECT centroid FROM topics WHERE topic_id = $1", topic_id)
+            current_centroid = np.array(current_centroid) if not isinstance(current_centroid, np.ndarray) else current_centroid
+            new_centroid = (1 - alpha) * current_centroid + alpha * v_array
+            await conn.execute(
+                "UPDATE topics SET centroid = $1, updated_at = NOW() WHERE topic_id = $2",
+                new_centroid, topic_id
+            )
 
     if not topic_id:
         # Create a new topic
         topic_id = str(uuid.uuid4())
         title = f"Topic {topic_id[:8]}"
         
-        if use_vector:
-            await conn.execute(
-                "INSERT INTO topics (topic_id, label, centroid, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW())",
-                topic_id, title, v
-            )
-        else:
-            embedding_blob = np.array(v, dtype=np.float32).tobytes()
-            await conn.execute(
-                "INSERT INTO topics (topic_id, label, centroid, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW())",
-                topic_id, title, embedding_blob
-            )
+        await conn.execute(
+            "INSERT INTO topics (topic_id, label, centroid, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW())",
+            topic_id, title, v_array
+        )
 
-    # Insert the snippet
-    if use_vector:
-        await conn.execute(
-            "INSERT INTO snippets (topic_id, text, embedding, created_at) VALUES ($1, $2, $3, NOW())",
-            topic_id, text, v
-        )
-    else:
-        embedding_blob = np.array(v, dtype=np.float32).tobytes()
-        await conn.execute(
-            "INSERT INTO snippets (topic_id, text, embedding, created_at) VALUES ($1, $2, $3, NOW())",
-            topic_id, text, embedding_blob
-        )
+    # Insert the snippet with numpy array for embedding
+    await conn.execute(
+        "INSERT INTO snippets (topic_id, text, embedding, chat_id, ts, created_at) VALUES ($1, $2, $3, $4, $5, NOW())",
+        topic_id, text, v_array, chat_id, ts
+    )
 
 
 
