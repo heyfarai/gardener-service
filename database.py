@@ -50,9 +50,11 @@ async def init_db():
             await connection.execute('DROP TABLE IF EXISTS topics CASCADE')
             
             # Try to create the vector extension, but continue if it fails
+            vector_available = False
             try:
                 await connection.execute('CREATE EXTENSION IF NOT EXISTS vector;')
                 logger.info("Vector extension created or already exists")
+                vector_available = True
             except Exception as e:
                 logger.warning(f"Could not create vector extension: {e}")
                 logger.warning("Continuing without vector extension - some features may be limited")
@@ -85,14 +87,17 @@ async def init_db():
                 );
             """)
             
-            # Try to alter the tables to use vector type if the extension is available
-            try:
-                await connection.execute('ALTER TABLE topics ALTER COLUMN centroid TYPE VECTOR(384) USING centroid::VECTOR;')
-                await connection.execute('ALTER TABLE snippets ALTER COLUMN embedding TYPE VECTOR(384) USING embedding::VECTOR;')
-                logger.info("Successfully converted columns to VECTOR type")
-            except Exception as e:
-                logger.warning(f"Could not convert columns to VECTOR type: {e}")
-                logger.warning("Using BYTEA for vector storage - some features may be limited")
+            # Try to alter the tables to use vector type only if the extension is available
+            if vector_available:
+                try:
+                    await connection.execute('ALTER TABLE topics ALTER COLUMN centroid TYPE VECTOR(384) USING centroid::VECTOR;')
+                    await connection.execute('ALTER TABLE snippets ALTER COLUMN embedding TYPE VECTOR(384) USING embedding::VECTOR;')
+                    logger.info("Successfully converted columns to VECTOR type")
+                except Exception as e:
+                    logger.warning(f"Could not convert columns to VECTOR type: {e}")
+                    logger.warning("Using BYTEA for vector storage - some features may be limited")
+            else:
+                logger.info("Vector extension not available - using BYTEA for vector storage")
         
         logger.info("Database initialized with updated schema.")
     except Exception as e:
