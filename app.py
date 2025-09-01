@@ -139,16 +139,7 @@ class Turn(BaseModel):
 
 @app.get("/health")
 def health(): 
-    try:
-        return {
-            "ok": True, 
-            "database": "connected" if db_pool else "memory",
-            "embedding": "openai" if (USE_OPENAI and openai_client) else "fallback",
-            "cors_origins": CORS_ORIGINS
-        }
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return {"ok": False, "error": str(e)}
+    return {"status": "healthy"}
 
 @app.get("/topics")
 async def list_topics():
