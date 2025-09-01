@@ -66,6 +66,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Environment check - USE_OPENAI: {USE_OPENAI}, OPENAI_API_KEY present: {bool(OPENAI_API_KEY)}")
     try:
         if USE_OPENAI and OPENAI_API_KEY:
+            logger.info("Attempting to initialize OpenAI client...")
             openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
             logger.info("OpenAI embeddings initialized successfully")
         else:
