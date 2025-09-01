@@ -5,8 +5,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import os, time, uuid, math, logging
 import asyncpg
 import openai
-from sentence_transformers import SentenceTransformer
-import numpy as np
 from contextlib import asynccontextmanager
 
 # Environment configuration
@@ -64,8 +62,7 @@ async def lifespan(app: FastAPI):
             openai.api_key = OPENAI_API_KEY
             logger.info("OpenAI embeddings initialized")
         else:
-            embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-            logger.info(f"SentenceTransformer model '{EMBEDDING_MODEL}' loaded")
+            logger.info("Using fallback embeddings (set USE_OPENAI=true for better results)")
     except Exception as e:
         logger.error(f"Embedding model initialization failed: {e}")
     
@@ -86,7 +83,7 @@ SNIPS = [] # {id, chat_id, ts, text, vec, topic_id}
 TOPICS = {} # id -> {label, centroid, updated}
 
 async def embed(text: str) -> List[float]:
-    """Generate embeddings using OpenAI or SentenceTransformer"""
+    """Generate embeddings using OpenAI or fallback"""
     try:
         if USE_OPENAI and OPENAI_API_KEY:
             response = await openai.Embedding.acreate(
@@ -94,14 +91,11 @@ async def embed(text: str) -> List[float]:
                 input=text
             )
             return response['data'][0]['embedding']
-        elif embedding_model:
-            embedding = embedding_model.encode(text)
-            return embedding.tolist()
         else:
-            # Fallback to deterministic fake embeddings for development
+            # Fallback to deterministic fake embeddings
             import hashlib, random
             random.seed(int(hashlib.md5(text.encode()).hexdigest(),16) % 10**6)
-            return [random.random() for _ in range(384)]  # MiniLM dimension
+            return [random.random() for _ in range(384)]
     except Exception as e:
         logger.error(f"Embedding generation failed: {e}")
         # Fallback to fake embeddings
@@ -127,7 +121,7 @@ def health():
     return {
         "ok": True, 
         "database": "connected" if db_pool else "memory",
-        "embedding": "openai" if USE_OPENAI else "sentence_transformer"
+        "embedding": "openai" if USE_OPENAI else "fallback"
     }
 
 @app.get("/topics")
